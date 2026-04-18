@@ -62,6 +62,9 @@ llm       = ChatGroq(model="llama-3.1-8b-instant")       # fast: planner, review
 llm_smart = ChatGroq(model="llama-3.3-70b-versatile")   # smart: architect, coder, patch
 store = FeedbackStore()
 
+# Set to True when running via the web server so input()-based prompts are skipped
+HEADLESS = False
+
 
 def _load_agent_rules() -> tuple[str, str, str]:
     """Returns (planner_rules_str, architect_rules_str, coder_rules_str)."""
@@ -190,6 +193,22 @@ def _run_executor(plan: Plan, coder_state: CoderState) -> dict:
         "## Windows\n```\nrun.bat\n```\n\n## Linux/Mac\n```\nbash run.sh\n```\n"
     )
     write_file.run({"path": "HOW_TO_RUN.md", "content": md})
+
+    # Drop Windows-incompatible, Unix-only, or file-referencing commands where the
+    # file doesn't actually exist in the project directory.
+    _BAD_PREFIX = ("chmod", "npm install", "npm run", "yarn", "brew ", "apt ", "sudo ",
+                   "pip install -r", "pip3 install -r")
+    def _cmd_ok(cmd: str) -> bool:
+        c = cmd.strip()
+        if any(c.startswith(b) for b in _BAD_PREFIX):
+            return False
+        # reject any "X -r <file>" style install where <file> is missing
+        import re as _re
+        m = _re.search(r"-r\s+(\S+)", c)
+        if m and not (PROJECT_ROOT / m.group(1)).exists():
+            return False
+        return True
+    resp.setup_commands = [c for c in resp.setup_commands if _cmd_ok(c)]
 
     # ── Setup ────────────────────────────────────────────────────────────────
     if resp.setup_commands:
@@ -467,6 +486,8 @@ def feedback_agent(state: dict) -> dict:
     coder_state: CoderState = state.get("coder_state")
     if coder_state is None:
         return {"coder_state": coder_state}
+    if HEADLESS:
+        return {"coder_state": coder_state}
     plan: Plan = coder_state.task_plan.plan
     entry = collect_feedback(
         user_prompt=state.get("user_prompt", ""),
@@ -479,7 +500,6 @@ def feedback_agent(state: dict) -> dict:
         rating, total = entry["rating"], store.total()
         stars = "★" * rating + "☆" * (5 - rating)
         print(f"\n✓ Feedback saved [{stars}] — {total} total entr{'y' if total == 1 else 'ies'}.")
-    # Always carry coder_state forward
     return {"coder_state": coder_state}
 
 

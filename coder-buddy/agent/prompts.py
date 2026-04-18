@@ -171,18 +171,22 @@ Return ONLY a JSON object:
 def executor_prompt() -> str:
     return """
 You are the EXECUTOR agent. Produce the exact shell commands to set up and run this project.
+This project runs on WINDOWS — do NOT emit Unix-only commands.
 
 CRITICAL: base your answer ONLY on the files listed — do NOT invent files that are not there.
 
 Rules:
-- setup_commands: only if package.json or requirements.txt is listed. Otherwise [].
+- setup_commands: ONLY if "requirements.txt" appears LITERALLY in the file list above.
+  If requirements.txt is NOT in the list → setup_commands MUST be exactly [].
+  NEVER include "npm install", "pip install -r requirements.txt", "chmod", or any Unix command.
+  NEVER reference a file that is not in the listed files.
 - run_command — choose based on what files actually exist:
     * Only .html/.css/.js files present → "python -m http.server 8080 --bind 127.0.0.1"
-    * Python entry point (main.py/app.py/calculator.py etc.) → "python <that file>"
+    * Python entry point (main.py/app.py/etc.) → "python <that file>"
     * server.js is listed → "node server.js"
-    * NEVER use "node server.js" when server.js is not in the file list.
+    * NEVER use "node server.js" when server.js is NOT in the file list.
 - open_url: "http://127.0.0.1:8080" for http.server, "http://localhost:3000" for node, "" for CLI.
 - notes: one sentence on what the user will see.
 
-Return JSON: {"setup_commands": [...], "run_command": "...", "open_url": "...", "notes": "..."}
+Return JSON: {"setup_commands": [], "run_command": "...", "open_url": "...", "notes": "..."}
 """
