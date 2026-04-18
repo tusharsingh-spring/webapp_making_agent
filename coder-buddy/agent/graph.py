@@ -17,8 +17,8 @@ def _parse_retry_after(msg: str) -> float:
     return 10.0  # fallback
 
 
-def _llm_invoke_with_retry(chain, prompt: str, retries: int = 3):
-    """Invoke an LLM chain, retrying on rate-limit errors with the exact wait from the error."""
+def _llm_invoke_with_retry(chain, prompt: str, retries: int = 4):
+    """Invoke an LLM chain, retrying on rate-limit AND parse/validation errors."""
     for attempt in range(retries):
         try:
             return chain.invoke(prompt)
@@ -28,9 +28,15 @@ def _llm_invoke_with_retry(chain, prompt: str, retries: int = 3):
                 wait = _parse_retry_after(msg)
                 print(f"\n[Rate limit] Waiting {wait:.0f}s (retry {attempt + 1}/{retries})…")
                 time.sleep(wait)
+            elif "OutputParserException" in type(e).__name__ or "ValidationError" in type(e).__name__:
+                if attempt < retries - 1:
+                    print(f"\n[Parse error] Retrying ({attempt + 1}/{retries})…")
+                    time.sleep(1)
+                else:
+                    raise
             else:
                 raise
-    raise RuntimeError("LLM rate limit: all retries exhausted.")
+    raise RuntimeError("LLM retries exhausted.")
 
 from dotenv import load_dotenv
 from langchain.globals import set_verbose, set_debug
@@ -52,7 +58,8 @@ _ = load_dotenv()
 set_debug(False)
 set_verbose(False)
 
-llm = ChatGroq(model="llama-3.1-8b-instant")
+llm       = ChatGroq(model="llama-3.1-8b-instant")       # fast: planner, reviewer
+llm_smart = ChatGroq(model="llama-3.3-70b-versatile")   # smart: architect, coder, patch
 store = FeedbackStore()
 
 
@@ -66,68 +73,39 @@ def _load_agent_rules() -> tuple[str, str, str]:
     )
 
 
-class FileContent(BaseModel):
-    content: str = Field(description="The complete content of the file to be written")
-
-
-def _extract_from_failed(failed: str) -> "FileContent | None":
-    """Extract file content from Groq's failed_generation string."""
-
-    def _unescape(s: str) -> str:
-        return s.replace("\\n", "\n").replace("\\t", "\t").replace('\\"', '"').replace("\\\\", "\\")
-
-    # 1. Replace triple-quoted values with proper JSON strings, then parse
-    def _fix_triple(s: str) -> str:
-        return re.sub(
-            r'"""([\s\S]*?)"""',
-            lambda m: '"' + m.group(1).replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n") + '"',
-            s,
-        )
-
-    for candidate in (failed, _fix_triple(failed)):
-        try:
-            data = _json.loads(candidate)
-            content = data.get("content", "")
-            if content.strip():
-                print("[Coder] Recovered content via JSON parse.")
-                return FileContent(content=content)
-        except Exception:
-            pass
-
-    # 2. Triple-quote bare extraction (lazy, handles literal \n at end)
-    m = re.search(r'"content"\s*:\s*"""([\s\S]+?)"""', failed)
+def _extract_code_block(text: str, ext: str = "") -> str:
+    """Pull content out of the first code block in an LLM response."""
+    # Try ```ext ... ```
+    if ext:
+        m = re.search(rf'```{re.escape(ext)}\s*\n?([\s\S]+?)```', text, re.IGNORECASE)
+        if m:
+            return m.group(1).strip()
+    # Try ``` ... ``` (any language tag or none)
+    m = re.search(r'```[^\n]*\n([\s\S]+?)```', text)
     if m:
-        print("[Coder] Recovered content from triple-quoted generation.")
-        return FileContent(content=_unescape(m.group(1)))
-
-    # 3. Greedy single-quoted extraction
-    m = re.search(r'"content"\s*:\s*"([\s\S]+)"', failed)
-    if m:
-        raw = _unescape(m.group(1))
-        if raw.strip():
-            print("[Coder] Recovered content from failed JSON generation.")
-            return FileContent(content=raw)
-
-    return None
+        return m.group(1).strip()
+    # No fences — return everything (model skipped the block)
+    return text.strip()
 
 
-def _invoke_file_content(prompt: str) -> "FileContent | None":
-    """json_mode LLM call with fallback extraction when Groq rejects the output."""
-    try:
-        return _llm_invoke_with_retry(llm.with_structured_output(FileContent, method="json_mode"), prompt)
-    except Exception as e:
-        failed = ""
-        if hasattr(e, "response"):
-            try:
-                failed = e.response.json().get("error", {}).get("failed_generation", "")
-            except Exception:
-                pass
-        if not failed:
-            raise
-        result = _extract_from_failed(failed)
-        if result:
-            return result
-        raise
+def _invoke_file_content(prompt: str, filepath: str, llm_instance=None) -> str | None:
+    """Raw LLM call — ask for file content inside a code block, extract via regex.
+
+    Code blocks are far more reliable than json_mode for weak models: no JSON
+    escaping, no 'content' key confusion, and models are trained to use them.
+    """
+    ext = filepath.rsplit(".", 1)[-1].lower() if "." in filepath else ""
+    model = llm_instance or llm
+    full_prompt = (
+        prompt
+        + f"\n\nReturn ONLY the complete, final content of `{filepath}` "
+        + f"inside a single ```{ext} ... ``` code block. "
+        + "No explanation. No text outside the code block."
+    )
+    response = _llm_invoke_with_retry(model, full_prompt)
+    text = response.content if hasattr(response, "content") else str(response)
+    content = _extract_code_block(text, ext)
+    return content if content else None
 
 
 class RunScript(BaseModel):
@@ -162,12 +140,24 @@ def _design_for(prompt: str) -> tuple[bool, str, str]:
     return False, "", ""
 
 
+def _free_port(port: int) -> None:
+    """Kill any process occupying the given port on Windows (best-effort)."""
+    try:
+        result = subprocess.run(
+            f'for /f "tokens=5" %a in (\'netstat -aon ^| findstr ":{port}"\') do taskkill /F /PID %a',
+            shell=True, capture_output=True, timeout=5,
+        )
+    except Exception:
+        pass
+
+
 def _run_executor(plan: Plan, coder_state: CoderState) -> dict:
     """Launch the app non-blocking: stream boot logs, open browser, return immediately."""
     global _running_proc
 
-    # Kill any previously running app before relaunching
+    # Kill any previously running app then free the port to avoid ERR_EMPTY_RESPONSE
     kill_running_app()
+    _free_port(8080)
 
     files = list_files.run(".")
     prompt = (
@@ -276,11 +266,11 @@ def planner_agent(state: dict) -> dict:
     if lessons:
         print(f"[Feedback] {store.total()} past entries loaded.")
 
-    resp = _llm_invoke_with_retry(llm.with_structured_output(Plan, method="json_mode"),
+    resp = _llm_invoke_with_retry(llm_smart.with_structured_output(Plan, method="json_mode"),
         planner_prompt(user_prompt, lessons=lessons, rules=p_rules)
     )
-    if resp is None:
-        raise ValueError("Planner returned nothing.")
+    if resp is None or not resp.files:
+        raise ValueError("Planner returned nothing or no valid files.")
     return {"plan": resp, "lessons": lessons, "enhance": enhance,
             "design_prompt": design_prompt, "palette": palette,
             "arch_rules": a_rules, "coder_rules": c_rules}
@@ -293,7 +283,7 @@ def architect_agent(state: dict) -> dict:
     lessons: str = store.get_lessons(techstack=plan.techstack, limit=3)
 
     resp = _llm_invoke_with_retry(
-        llm.with_structured_output(TaskPlan, method="json_mode"),
+        llm_smart.with_structured_output(TaskPlan, method="json_mode"),
         architect_prompt(plan.model_dump_json(), user_prompt=user_prompt,
                          lessons=lessons, rules=a_rules),
     )
@@ -334,100 +324,149 @@ def coder_agent(state: dict) -> dict:
     existing_content = read_file.run(current_task.filepath)
     plan: Plan = coder_state.task_plan.plan
 
+    # Build cross-file context: show FULL content of already-written files so
+    # JS can see exactly which classes/IDs/data-* exist in HTML before referencing them.
+    all_files = [f.path for f in plan.files]
+    written_ctx_parts = []
+    for f in plan.files:
+        if f.path == current_task.filepath:
+            continue
+        content = read_file.run(f.path)
+        if content:
+            written_ctx_parts.append(f"=== {f.path} (already written — FULL CONTENT) ===\n{content}")
+    written_ctx = ("\n\n" + "\n\n".join(written_ctx_parts)) if written_ctx_parts else ""
+
+    # Derive explicit link instructions from the filepath
+    ext = current_task.filepath.rsplit(".", 1)[-1].lower()
+    css_files  = [p for p in all_files if p.endswith(".css")]
+    js_files   = [p for p in all_files if p.endswith(".js")]
+    link_hint  = ""
+    if ext == "html":
+        links = [f'<link rel="stylesheet" href="{c}">' for c in css_files]
+        links += [f'<script src="{j}" defer></script>' for j in js_files]
+        link_hint = (
+            "\nLINKING (include ALL of these in <head>):\n"
+            + "\n".join(f"  {l}" for l in links)
+            + "\n"
+        )
+
+    change_request: str = state.get("change_request", "")
+    change_ctx = (
+        f"\nREFINEMENT REQUEST: {change_request}\n"
+        "Apply this change while preserving everything else.\n"
+    ) if change_request else ""
+
     prompt = (
         f"{coder_system_prompt(plan, user_prompt=user_prompt, lessons=lessons, design_prompt=design_prompt, rules=c_rules)}\n\n"
+        f"Project files: {', '.join(all_files)}\n"
+        f"{link_hint}"
+        f"{change_ctx}"
         f"Task: {current_task.task_description}\n"
-        f"File: {current_task.filepath}\n"
-        f"Existing content:\n{existing_content}\n\n"
-        'Return ONLY valid JSON: {"content": "...file content..."}\n'
-        'Rules: escape newlines as \\n, escape double quotes as \\", do NOT use triple quotes.'
+        f"File to write: {current_task.filepath}\n"
+        f"Existing content:\n{existing_content or '(empty)'}\n"
+        f"{written_ctx}"
     )
 
-    resp = _invoke_file_content(prompt)
-    if resp and resp.content.strip():
-        write_file.run({"path": current_task.filepath, "content": resp.content})
+    # Use smart model during refinement — 8b can't reason about logic bugs
+    coder_model = llm_smart if change_request else llm
+    content = _invoke_file_content(prompt, current_task.filepath, coder_model)
+    if content and content.strip():
+        write_file.run({"path": current_task.filepath, "content": content})
         print(f"Wrote: {current_task.filepath}")
+    else:
+        print(f"[WARN] Coder returned empty content for {current_task.filepath} — skipping write.")
 
     coder_state.current_step_idx += 1
     return {"coder_state": coder_state}
 
 
 def reviewer_agent(state: dict) -> dict:
-    """
-    Reviews all generated files for quality issues.
-    If problems found, creates fix tasks and resets coder_state to patch them.
-    Runs at most once (review_done flag prevents infinite loops).
-    """
-    if state.get("review_done"):
-        return {"status": "DONE", "coder_state": state.get("coder_state")}
-
+    """Reads all files, finds cross-file bugs, fixes them inline. No loop back to coder."""
     coder_state: CoderState = state["coder_state"]
     plan: Plan = coder_state.task_plan.plan
-    c_rules: str = state.get("coder_rules", "")
 
-    # Read all generated files
-    file_entries = []
-    for task in coder_state.task_plan.implementation_steps:
-        content = read_file.run(task.filepath)
-        if content:
-            preview = content[:300].replace("\n", " ")
-            file_entries.append(f"--- {task.filepath} ({len(content)} chars) ---\n{preview}…")
+    # Read all project files
+    file_contents: dict[str, str] = {}
+    for f in plan.files:
+        if f.path in file_contents:
+            continue
+        fc = read_file.run(f.path)
+        if fc:
+            file_contents[f.path] = fc
 
-    if not file_entries:
-        return {"status": "DONE", "review_done": True, "coder_state": coder_state}
+    if not file_contents:
+        return {"status": "DONE", "coder_state": coder_state}
 
-    files_block = "\n\n".join(file_entries)
-
-    class ReviewResult(BaseModel):
-        has_issues: bool = Field(description="True if any quality issues were found")
-        issues: list[dict] = Field(default_factory=list, description="List of {filepath, problem, fix}")
-        summary: str = Field(description="One-line verdict")
-
-    resp = _llm_invoke_with_retry(
-        llm.with_structured_output(ReviewResult, method="json_mode"),
-        reviewer_prompt(plan.name, plan.techstack, files_block)
+    files_block = "\n\n".join(
+        f"--- {fp} ({len(c)} chars) ---\n{c}" for fp, c in file_contents.items()
     )
 
-    if resp is None or not resp.has_issues:
-        print(f"[Reviewer] ✓ {resp.summary if resp else 'Files look good.'}")
-        return {"status": "DONE", "review_done": True, "coder_state": coder_state}
-
-    print(f"[Reviewer] Issues found: {resp.summary}")
-    fix_steps = [
-        ImplementationTask(
-            filepath=issue.get("filepath", ""),
-            task_description=issue.get("fix", "Fix quality issues in this file"),
+    class ReviewResult(BaseModel):
+        has_issues: bool = Field(description="True only for bugs that break the app")
+        issues: list[dict] = Field(
+            default_factory=list,
+            description='[{"filepath":"...","problem":"...","fix":"exact fix instructions"}]'
         )
-        for issue in resp.issues
-        if issue.get("filepath")
-    ]
+        summary: str = Field(description="One-line verdict")
 
-    if not fix_steps:
-        return {"status": "DONE", "review_done": True, "coder_state": coder_state}
+    try:
+        resp = _llm_invoke_with_retry(
+            llm.with_structured_output(ReviewResult, method="json_mode"),
+            reviewer_prompt(plan.name, plan.techstack, files_block)
+        )
+    except Exception:
+        resp = None
 
+    if resp is None or not resp.has_issues:
+        print(f"[Reviewer] ✓ {resp.summary if resp else 'Looks good.'}")
+        return {"status": "DONE", "coder_state": coder_state}
+
+    print(f"[Reviewer] Fixing inline: {resp.summary}")
+
+    # Group fixes by file, then fix each file once with a single LLM call
+    fixes_by_file: dict[str, list[str]] = {}
     for issue in resp.issues:
-        print(f"  • {issue.get('filepath')}: {issue.get('problem')}")
+        fp = issue.get("filepath", "")
+        fix = issue.get("fix") or issue.get("problem") or ""
+        prob = issue.get("problem", fix)
+        if fp and fix:
+            fixes_by_file.setdefault(fp, []).append(fix)
+            print(f"  • {fp}: {prob}")
 
-    fix_plan = TaskPlan(implementation_steps=fix_steps)
-    fix_plan.plan = plan
-    new_coder_state = CoderState(task_plan=fix_plan, current_step_idx=0)
-    return {"coder_state": new_coder_state, "status": None, "review_done": True,
-            "coder_rules": c_rules}
+    for fp, fixes in fixes_by_file.items():
+        other_files = "\n\n".join(
+            f"=== {p} ===\n{c}" for p, c in file_contents.items() if p != fp
+        )
+        fix_prompt = (
+            f"Project: {plan.name} ({plan.techstack})\n\n"
+            f"Other files for reference:\n{other_files}\n\n"
+            f"File to fix: {fp}\n"
+            f"Current content:\n{file_contents.get(fp, '')}\n\n"
+            f"Fix these issues:\n" + "\n".join(f"- {f}" for f in fixes)
+        )
+        fixed = _invoke_file_content(fix_prompt, fp, llm_smart)
+        if fixed and fixed.strip():
+            write_file.run({"path": fp, "content": fixed})
+            file_contents[fp] = fixed  # keep context fresh for next file
+            print(f"  ✓ Fixed: {fp}")
+
+    return {"status": "DONE", "coder_state": coder_state}
 
 
 def executor_agent(state: dict) -> dict:
     coder_state: CoderState = state.get("coder_state")
     if coder_state is None:
         print("[Executor] No project state — skipping launch.")
-        return {}
+        return {"coder_state": coder_state}
     result = _run_executor(coder_state.task_plan.plan, coder_state)
-    return result
+    # Always carry coder_state forward so refinement can access it
+    return {"coder_state": coder_state, **result}
 
 
 def feedback_agent(state: dict) -> dict:
     coder_state: CoderState = state.get("coder_state")
     if coder_state is None:
-        return {}  # generation was interrupted before coder finished
+        return {"coder_state": coder_state}
     plan: Plan = coder_state.task_plan.plan
     entry = collect_feedback(
         user_prompt=state.get("user_prompt", ""),
@@ -440,7 +479,8 @@ def feedback_agent(state: dict) -> dict:
         rating, total = entry["rating"], store.total()
         stars = "★" * rating + "☆" * (5 - rating)
         print(f"\n✓ Feedback saved [{stars}] — {total} total entr{'y' if total == 1 else 'ies'}.")
-    return {}
+    # Always carry coder_state forward
+    return {"coder_state": coder_state}
 
 
 # ── Refinement graph agents ───────────────────────────────────────────────────
@@ -461,7 +501,7 @@ def patch_planner_agent(state: dict) -> dict:
     files = list_files.run(".")
 
     resp = _llm_invoke_with_retry(
-        llm.with_structured_output(PatchPlan, method="json_mode"),
+        llm_smart.with_structured_output(PatchPlan, method="json_mode"),
         patch_planner_prompt(change_request, plan.name, plan.techstack, files),
     )
     if resp is None or not resp.tasks:
@@ -488,46 +528,84 @@ def patch_planner_agent(state: dict) -> dict:
     }
 
 
-def patch_coder_agent(state: dict) -> dict:
-    """Coder in patch mode — reads existing file, applies change, writes back."""
-    coder_state: CoderState = state.get("coder_state")
-    if coder_state is None:
-        return {"status": "DONE"}
-    design_prompt: str = state.get("design_prompt", "")
-    user_prompt: str = state.get("user_prompt", "")
+
+def debugger_agent(state: dict) -> dict:
+    """Uses the smart model to diagnose the exact logic bugs before the coder runs."""
     change_request: str = state.get("change_request", "")
+    coder_state: CoderState = state.get("coder_state")
+    if not change_request or coder_state is None:
+        return {"coder_state": coder_state}
 
-    steps = coder_state.task_plan.implementation_steps
-    if coder_state.current_step_idx >= len(steps):
-        return {"coder_state": coder_state, "status": "DONE"}
-
-    current_task = steps[coder_state.current_step_idx]
-    existing_content = read_file.run(current_task.filepath)
     plan: Plan = coder_state.task_plan.plan
 
-    prompt = (
-        f"{coder_system_prompt(plan, user_prompt=user_prompt, design_prompt=design_prompt)}\n\n"
-        f"You are PATCHING an existing file based on a user change request.\n"
-        f"Change request: {change_request}\n"
-        f"Specific change for this file: {current_task.task_description}\n\n"
-        f"File: {current_task.filepath}\n"
-        f"CURRENT content (keep everything that isn't being changed):\n{existing_content}\n\n"
-        'Return ONLY valid JSON: {"content": "...full updated file..."}\n'
-        'Rules: escape newlines as \\n, escape double quotes as \\", do NOT use triple quotes.'
-    )
+    # Read all project files for full context
+    file_contents: dict[str, str] = {}
+    for f in plan.files:
+        c = read_file.run(f.path)
+        if c:
+            file_contents[f.path] = c
 
-    resp = _invoke_file_content(prompt)
-    if resp and resp.content.strip():
-        write_file.run({"path": current_task.filepath, "content": resp.content})
-        print(f"Patched: {current_task.filepath}")
+    if not file_contents:
+        return {"coder_state": coder_state}
 
-    coder_state.current_step_idx += 1
+    files_block = "\n\n".join(f"=== {fp} ===\n{c}" for fp, c in file_contents.items())
+    target_files = [s.filepath for s in coder_state.task_plan.implementation_steps]
+
+    prompt = f"""You are a DEBUGGER. The user reports: "{change_request}"
+
+Project: {plan.name} ({plan.techstack})
+Files to fix: {target_files}
+
+ALL project files (read carefully before diagnosing):
+{files_block}
+
+Identify the EXACT lines causing the reported behavior in each target file.
+For each file produce a precise fix description covering:
+- what specific code is wrong and why (line numbers if helpful)
+- exactly what the corrected logic should be
+
+Return ONLY this JSON:
+{{
+  "diagnoses": [
+    {{
+      "filepath": "script.js",
+      "root_cause": "line 17 catches '=' in the operator branch before the equals handler, so the equals branch is dead code",
+      "fix_instructions": "full detailed instructions for the coder"
+    }}
+  ]
+}}"""
+
+    class _Diagnosis(BaseModel):
+        diagnoses: list[dict] = Field(default_factory=list)
+
+    try:
+        resp = _llm_invoke_with_retry(
+            llm_smart.with_structured_output(_Diagnosis, method="json_mode"),
+            prompt,
+        )
+    except Exception:
+        resp = None
+
+    if resp and resp.diagnoses:
+        diag_map = {d["filepath"]: d for d in resp.diagnoses if d.get("filepath")}
+        for step in coder_state.task_plan.implementation_steps:
+            if step.filepath in diag_map:
+                d = diag_map[step.filepath]
+                step.task_description = (
+                    f"ROOT CAUSE: {d.get('root_cause', '')}\n\n"
+                    f"FIX: {d.get('fix_instructions', step.task_description)}"
+                )
+                print(f"[Debugger] {step.filepath}: {d.get('root_cause', '')[:120]}")
+
     return {"coder_state": coder_state}
 
 
 def patch_executor_agent(state: dict) -> dict:
-    coder_state: CoderState = state["coder_state"]
-    return _run_executor(coder_state.task_plan.plan, coder_state)
+    coder_state: CoderState = state.get("coder_state")
+    if coder_state is None:
+        print("[Executor] No coder_state — skipping relaunch.")
+        return {}
+    return {"coder_state": coder_state, **_run_executor(coder_state.task_plan.plan, coder_state)}
 
 
 # ── Main graph ────────────────────────────────────────────────────────────────
@@ -547,33 +625,35 @@ graph.add_conditional_edges(
     lambda s: "reviewer" if s.get("status") == "DONE" else "coder",
     {"reviewer": "reviewer", "coder": "coder"},
 )
-graph.add_conditional_edges(
-    "reviewer",
-    lambda s: "feedback" if s.get("status") == "DONE" else "coder",
-    {"feedback": "feedback", "coder": "coder"},
-)
-graph.add_edge("feedback", "executor")
-graph.add_edge("executor", END)
+graph.add_edge("reviewer", "executor")
+graph.add_edge("executor", "feedback")
+graph.add_edge("feedback", END)
 graph.set_entry_point("planner")
 agent = graph.compile()
 
 # ── Refinement graph ──────────────────────────────────────────────────────────
+# Uses the same coder_agent + reviewer_agent as the main graph so refinements
+# get full cross-file context and inline fixes — not a lightweight patch path.
 
 refinement_graph = StateGraph(dict)
-refinement_graph.add_node("patch_planner", patch_planner_agent)
-refinement_graph.add_node("patch_coder",   patch_coder_agent)
+refinement_graph.add_node("patch_planner",  patch_planner_agent)
+refinement_graph.add_node("debugger",       debugger_agent)
+refinement_graph.add_node("coder",          coder_agent)
+refinement_graph.add_node("reviewer",       reviewer_agent)
 refinement_graph.add_node("patch_executor", patch_executor_agent)
 
 refinement_graph.add_conditional_edges(
     "patch_planner",
-    lambda s: "patch_executor" if s.get("status") == "DONE" else "patch_coder",
-    {"patch_executor": "patch_executor", "patch_coder": "patch_coder"},
+    lambda s: "patch_executor" if s.get("status") == "DONE" else "debugger",
+    {"patch_executor": "patch_executor", "debugger": "debugger"},
 )
+refinement_graph.add_edge("debugger", "coder")
 refinement_graph.add_conditional_edges(
-    "patch_coder",
-    lambda s: "patch_executor" if s.get("status") == "DONE" else "patch_coder",
-    {"patch_executor": "patch_executor", "patch_coder": "patch_coder"},
+    "coder",
+    lambda s: "reviewer" if s.get("status") == "DONE" else "coder",
+    {"reviewer": "reviewer", "coder": "coder"},
 )
+refinement_graph.add_edge("reviewer",       "patch_executor")
 refinement_graph.add_edge("patch_executor", END)
 refinement_graph.set_entry_point("patch_planner")
 refinement_agent = refinement_graph.compile()

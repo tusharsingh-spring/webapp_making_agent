@@ -93,32 +93,52 @@ Base rules:
 - Use consistent names across all files.
 - Python entry points: include if __name__ == '__main__':
 - HTML: include DOCTYPE, charset, viewport meta, all CSS/JS linked or inline.
+
+FILE-TYPE PURITY (strictly enforced):
+- .js files  → ONLY JavaScript. Zero HTML tags. Zero CSS. No <script>, <style>, <div>.
+- .css files → ONLY CSS rules. No JavaScript. No HTML elements.
+- .html files → complete HTML document. All JS in <script> tags or <script src="...">.
+- Only link/import files that are explicitly listed in the project plan.
+
+CROSS-FILE CONSISTENCY (critical — mismatches cause runtime crashes):
+- When writing .js: read the FULL HTML shown above. ONLY use querySelector/getElementById/
+  getElementsByClassName with selectors that ACTUALLY EXIST in that HTML.
+  If you need a button, ensure it exists in HTML first (or add it in the HTML task).
+- When writing .html: include every element that script.js will need to query.
+- Never assume an element exists — verify it in the already-written files shown above.
 """
 
 
 def reviewer_prompt(plan_name: str, techstack: str, files_contents: str) -> str:
     return f"""
-You are the REVIEWER agent. Inspect the generated project files for quality issues.
+You are the REVIEWER agent. Read ALL files carefully and find bugs that would make the app broken or non-functional.
 
 Project : {plan_name}
 Stack   : {techstack}
 
-Generated files:
+Files (complete content):
 {files_contents}
 
-Check for these issues:
-- Empty or near-empty files (< 5 meaningful lines)
-- CSS files with no colours, no layout, or only comments
-- HTML files missing <script> or <link> tags for their dependencies
-- JS files with unimplemented stub functions (e.g. "// TODO")
-- Python files missing the main entry-point block
-- Files that don't match the project description at all
+Check ONLY for issues that would make the app crash or not work at all:
+1. JS calls document.querySelector / getElementById with a selector that does NOT exist in index.html
+2. JS reads element.dataset.X (e.g. data-index) but the HTML element is missing that data-* attribute
+3. HTML is missing <link rel="stylesheet"> or <script src="..."> for files in the project
+4. A function is called but never defined
+5. CSS file is empty or has only comments (no actual rules)
+6. JS file contains HTML tags (wrong content type)
+7. Missing if __name__ == '__main__': in Python entry point
+
+For each issue give a precise fix instruction that fully resolves it.
 
 Return ONLY a JSON object:
 {{
   "has_issues": true or false,
   "issues": [
-    {{"filepath": "style.css", "problem": "exact problem", "fix": "what must be done"}}
+    {{
+      "filepath": "script.js",
+      "problem": "calls document.querySelector('.reset-button') but .reset-button does not exist in index.html",
+      "fix": "Add <button class='reset-button'>Reset</button> to index.html inside .game-board, OR remove the querySelector call and handle reset differently in script.js"
+    }}
   ],
   "summary": "one-line overall verdict"
 }}
@@ -157,11 +177,11 @@ CRITICAL: base your answer ONLY on the files listed — do NOT invent files that
 Rules:
 - setup_commands: only if package.json or requirements.txt is listed. Otherwise [].
 - run_command — choose based on what files actually exist:
-    * Only .html/.css/.js files present → "python -m http.server 8080"
+    * Only .html/.css/.js files present → "python -m http.server 8080 --bind 127.0.0.1"
     * Python entry point (main.py/app.py/calculator.py etc.) → "python <that file>"
     * server.js is listed → "node server.js"
     * NEVER use "node server.js" when server.js is not in the file list.
-- open_url: "http://localhost:8080" for http.server, "http://localhost:3000" for node, "" for CLI.
+- open_url: "http://127.0.0.1:8080" for http.server, "http://localhost:3000" for node, "" for CLI.
 - notes: one sentence on what the user will see.
 
 Return JSON: {"setup_commands": [...], "run_command": "...", "open_url": "...", "notes": "..."}

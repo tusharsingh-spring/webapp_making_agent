@@ -121,7 +121,11 @@ Return ONLY a JSON object:
 }}
 """
 
-    resp = _get_llm().with_structured_output(_RulesResponse, method="json_mode").invoke(prompt)
+    try:
+        resp = _get_llm().with_structured_output(_RulesResponse, method="json_mode").invoke(prompt)
+    except Exception as e:
+        print(f"[Tuner] LLM call failed ({e}) — keeping existing rules.")
+        return load_rules()
 
     rules = AgentRules(
         planner_rules=resp.planner_rules[:MAX_RULES_PER_AGENT] if resp else [],

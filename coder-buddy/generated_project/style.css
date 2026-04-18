@@ -1,0 +1,43 @@
+.game-container {
+    width: 80%;
+    margin: 0 auto;
+    text-align: center;
+}
+
+.game-board {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    grid-gap: 5px;
+    max-width: 400px;
+}
+
+.cell {
+    background-color: #FFC0CB; /* changed to pink */
+    padding: 20px;
+    border: 1px solid #333;
+    font-size: 24px;
+    font-weight: bold;
+    cursor: pointer;
+}
+
+.cell:hover {
+    background-color: #FF99CC; /* changed to lighter pink */
+}
+
+.cell:active {
+    background-color: #FF66CC; /* changed to darker pink */
+}
+
+.reset-button {
+    margin-top: 20px;
+    padding: 10px 20px;
+    background-color: #FFC0CB; /* changed to pink */
+    color: #fff;
+    border: none;
+    border-radius: 5px;
+    cursor: pointer;
+}
+
+.reset-button:hover {
+    background-color: #FF99CC; /* changed to lighter pink */
+}

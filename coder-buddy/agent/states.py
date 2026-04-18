@@ -1,38 +1,101 @@
 from typing import Optional
+from pydantic import BaseModel, Field, ConfigDict, model_validator
 
-from pydantic import BaseModel, Field, ConfigDict
+
+_VALID_EXTS = {
+    ".html", ".css", ".js", ".ts", ".jsx", ".tsx", ".vue",
+    ".py", ".json", ".md", ".txt", ".yaml", ".yml", ".env",
+}
 
 
 class File(BaseModel):
-    path: str = Field(description="The path to the file to be created or modified")
-    purpose: str = Field(description="The purpose of the file, e.g. 'main application logic', 'data processing module', etc.")
-    
+    path: str = Field(description="The path to the file")
+    purpose: str = Field(default="", description="What this file does")
+
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize(cls, v):
+        if isinstance(v, dict):
+            # accept 'description' or 'summary' as aliases for 'purpose'
+            if not v.get("purpose"):
+                v["purpose"] = v.pop("description", None) or v.pop("summary", None) or ""
+        return v
+
+
 class Plan(BaseModel):
-    name: str = Field(description="The name of app to be built")
-    description: str = Field(description="A oneline description of the app to be built, e.g. 'A web application for managing personal finances'")
-    techstack: str = Field(description="The tech stack to be used for the app, e.g. 'python', 'javascript', 'react', 'flask', etc.")
-    features: list[str] = Field(description="A list of features that the app should have, e.g. 'user authentication', 'data visualization', etc.")
-    files: list[File] = Field(description="A list of files to be created, each with a 'path' and 'purpose'")
+    name: str = Field(description="App name")
+    description: str = Field(description="One-line description")
+    techstack: str = Field(description="Comma-separated tech stack")
+    features: list[str] = Field(description="List of features")
+    files: list[File] = Field(description="Files to create")
+
+    @model_validator(mode="after")
+    def _clean_files(self):
+        seen: set[str] = set()
+        clean = []
+        for f in self.files:
+            # drop garbage files (config blobs, lint files, duplicates)
+            ext = "." + f.path.rsplit(".", 1)[-1].lower() if "." in f.path else ""
+            if f.path in seen or ext not in _VALID_EXTS:
+                continue
+            seen.add(f.path)
+            clean.append(f)
+        self.files = clean
+        return self
+
 
 class ImplementationTask(BaseModel):
-    filepath: str = Field(description="The path to the file to be modified")
-    task_description: str = Field(description="A detailed description of the task to be performed on the file, e.g. 'add user authentication', 'implement data processing logic', etc.")
+    filepath: str = Field(description="Path of the file to modify")
+    task_description: str = Field(description="Detailed description of what to implement")
+
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize(cls, v):
+        if isinstance(v, dict):
+            # accept 'description' or 'task' as aliases
+            if not v.get("task_description"):
+                v["task_description"] = (
+                    v.pop("description", None)
+                    or v.pop("task", None)
+                    or "Implement this file"
+                )
+            if not v.get("filepath"):
+                v["filepath"] = v.pop("file", None) or v.pop("path", None) or ""
+        return v
+
 
 class TaskPlan(BaseModel):
-    implementation_steps: list[ImplementationTask] = Field(description="A list of steps to be taken to implement the task")
+    implementation_steps: list[ImplementationTask] = Field(
+        description="Ordered list of files to implement"
+    )
     model_config = ConfigDict(extra="allow")
-    
+
+
 class CoderState(BaseModel):
-    task_plan: TaskPlan = Field(description="The plan for the task to be implemented")
-    current_step_idx: int = Field(0, description="The index of the current step in the implementation steps")
-    current_file_content: Optional[str] = Field(None, description="The content of the file currently being edited or created")
+    task_plan: TaskPlan = Field(description="The implementation plan")
+    current_step_idx: int = Field(0, description="Index of current step")
+    current_file_content: Optional[str] = Field(None, description="Content being edited")
 
 
 class PatchTask(BaseModel):
     filepath: str = Field(description="File to modify")
-    change_description: str = Field(description="Exactly what to add, change, or remove in this file")
+    change_description: str = Field(description="Exactly what to add, change, or remove")
+
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize(cls, v):
+        if isinstance(v, dict):
+            if not v.get("change_description"):
+                v["change_description"] = (
+                    v.pop("description", None)
+                    or v.pop("change", None)
+                    or "Apply the requested change"
+                )
+            if not v.get("filepath"):
+                v["filepath"] = v.pop("file", None) or v.pop("path", None) or ""
+        return v
 
 
 class PatchPlan(BaseModel):
     tasks: list[PatchTask] = Field(description="Files to patch and what to do in each")
-    summary: str = Field(description="One-line summary of all changes")
+    summary: str = Field(default="", description="One-line summary of all changes")
